@@ -1,20 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import FilterBar from './components/FilterBar.jsx'
-import KPICards from './components/KPICards.jsx'
-import TrendChart from './components/TrendChart.jsx'
-import ChannelROIChart from './components/ChannelROIChart.jsx'
-import DataTable from './components/DataTable.jsx'
-import Comparison from './components/Comparison.jsx'
-import ChannelRanking from './components/ChannelRanking.jsx'
-import DistributionPie from './components/DistributionPie.jsx'
+import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import Login from './components/Login.jsx'
 import SetPassword from './components/SetPassword.jsx'
+import AppLayout from './layout/AppLayout.jsx'
+import DashboardPage from './pages/DashboardPage.jsx'
+import PapeleraPage from './pages/PapeleraPage.jsx'
+import ClientesPage from './pages/ClientesPage.jsx'
+import ClienteDetailPage from './pages/ClienteDetailPage.jsx'
+import RegistrosPage from './pages/RegistrosPage.jsx'
+import UsuariosPage from './pages/UsuariosPage.jsx'
 
 import { STORAGE_KEY, CHANNELS, IS_META_ADS_CHANNEL } from './constants.js'
 import { storageGet, storageSet } from './lib/storage.js'
 import { aggregate, computeRowMetrics } from './lib/metrics.js'
 import { safeNumber } from './lib/numbers.js'
-import { rowsToCsv, downloadTextFile, parseCsvText } from './lib/csv.js'
+import { rowsToCsv, downloadTextFile } from './lib/csv.js'
 import { supabase } from './lib/supabaseClient.js'
 
 function makeId() {
@@ -89,24 +89,22 @@ function groupByChannel(rows) {
 }
 
 export default function App() {
+  const navigate = useNavigate()
+
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
   const [postLoginInfo, setPostLoginInfo] = useState('')
   const [rows, setRows] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [pendingImport, setPendingImport] = useState(null)
 
   const [authFlow, setAuthFlow] = useState(null)
-
-  const [view, setView] = useState('dashboard')
 
   const [filters, setFilters] = useState({ year: 2025, month: 'all', channel: 'all' })
   const [compare, setCompare] = useState({ month1: 7, month2: 8 })
   const [darkMode, setDarkMode] = useState(false)
 
   const saveTimersById = useRef({})
-  const csvFileInputRef = useRef(null)
 
   useEffect(() => {
     let mounted = true
@@ -127,7 +125,10 @@ export default function App() {
               : hashHasAccessToken || hashHasRefreshToken
                 ? 'recovery'
                 : null
-        if (flowType) setAuthFlow(flowType)
+        if (flowType) {
+          setAuthFlow(flowType)
+          navigate('/establecer-contraseña', { replace: true })
+        }
 
         // Links de Supabase pueden venir como:
         // - ?code=...&type=recovery (PKCE)
@@ -198,7 +199,6 @@ export default function App() {
     async function loadFromSupabase() {
       setLoading(true)
       setError('')
-      setPendingImport(null)
 
       try {
         const { data, error: fetchError } = await supabase
@@ -247,6 +247,14 @@ export default function App() {
 
   const years = useMemo(() => uniqueYears(rows), [rows])
 
+  const activeRows = useMemo(() => {
+    return rows.filter((r) => !r?.deletedAt)
+  }, [rows])
+
+  const trashedRows = useMemo(() => {
+    return rows.filter((r) => Boolean(r?.deletedAt))
+  }, [rows])
+
   useEffect(() => {
     if (!years.includes(filters.year)) {
       setFilters((f) => ({ ...f, year: years[years.length - 1] }))
@@ -254,24 +262,24 @@ export default function App() {
   }, [years, filters.year])
 
   const filteredRows = useMemo(() => {
-    return rows.filter((r) => {
+    return activeRows.filter((r) => {
       if (Number(r.año) !== Number(filters.year)) return false
       if (filters.month !== 'all' && Number(r.mes) !== Number(filters.month)) return false
       if (filters.channel !== 'all' && r.canal !== filters.channel) return false
       return true
     })
-  }, [rows, filters])
+  }, [activeRows, filters])
 
   const previousPeriod = useMemo(() => computePreviousPeriod(filters.year, filters.month), [filters.year, filters.month])
 
   const previousRows = useMemo(() => {
-    return rows.filter((r) => {
+    return activeRows.filter((r) => {
       if (Number(r.año) !== Number(previousPeriod.year)) return false
       if (previousPeriod.month !== 'all' && Number(r.mes) !== Number(previousPeriod.month)) return false
       if (filters.channel !== 'all' && r.canal !== filters.channel) return false
       return true
     })
-  }, [rows, previousPeriod, filters.channel])
+  }, [activeRows, previousPeriod, filters.channel])
 
   const currentAgg = useMemo(() => aggregate(filteredRows), [filteredRows])
   const previousAgg = useMemo(() => aggregate(previousRows), [previousRows])
@@ -334,22 +342,11 @@ export default function App() {
     }, 250)
   }
 
-  function handleAddRow() {
-    setPendingImport(null)
+  function handleCreateRow(draft) {
+    const id = makeId()
     const newRow = {
-      id: makeId(),
-      año: filters.year,
-      mes: filters.month === 'all' ? 1 : Number(filters.month),
-      semanaDelMes: 1,
-      fechaInicioSemana: '',
-      fechaFinSemana: '',
-      canal: filters.channel === 'all' ? CHANNELS[0] : filters.channel,
-      inversion: 0,
-      leads: '',
-      clientesNuevos: 0,
-      numeroVentas: 0,
-      ingresos: 0,
-      notas: '',
+      id,
+      ...(draft && typeof draft === 'object' ? draft : {}),
     }
 
     const next = sortRows([newRow, ...rows])
@@ -363,9 +360,14 @@ export default function App() {
       })
   }
 
-  function handleUpdateRow(id, key, value) {
-    setPendingImport(null)
-    const next = rows.map((r) => (r.id === id ? { ...r, [key]: value } : r))
+  function handlePatchRow(id, patch) {
+    const next = rows.map((r) => {
+      if (r.id !== id) return r
+      if (patch && typeof patch === 'object') {
+        return { ...r, ...patch, id: r.id }
+      }
+      return r
+    })
     const sorted = sortRows(next)
     setRows(sorted)
 
@@ -373,8 +375,30 @@ export default function App() {
     if (updatedRow) scheduleSaveRow(updatedRow)
   }
 
-  function handleDeleteRow(id) {
-    setPendingImport(null)
+  function handleTrashRow(id) {
+    const now = new Date().toISOString()
+    const next = rows.map((r) => (r.id === id ? { ...r, deletedAt: now } : r))
+    const sorted = sortRows(next)
+    setRows(sorted)
+
+    const updatedRow = sorted.find((r) => r.id === id)
+    if (updatedRow) scheduleSaveRow(updatedRow)
+  }
+
+  function handleRestoreRow(id) {
+    const next = rows.map((r) => {
+      if (r.id !== id) return r
+      const { deletedAt: _deletedAt, ...rest } = r
+      return rest
+    })
+    const sorted = sortRows(next)
+    setRows(sorted)
+
+    const updatedRow = sorted.find((r) => r.id === id)
+    if (updatedRow) scheduleSaveRow(updatedRow)
+  }
+
+  function handleDeleteRowPermanent(id) {
     const next = rows.filter((r) => r.id !== id)
     setRows(next)
 
@@ -407,145 +431,6 @@ export default function App() {
     downloadTextFile('sales-data-2025.csv', csv, 'text/csv;charset=utf-8')
   }
 
-  function normalizeImportNumber(raw) {
-    const s = String(raw ?? '').trim()
-    if (!s) return 0
-    const cleaned = s.replaceAll('$', '').replaceAll(' ', '').replaceAll(',', '')
-    const n = Number(cleaned)
-    return Number.isFinite(n) ? n : 0
-  }
-
-  function normalizeImportOptionalNumber(raw) {
-    const s = String(raw ?? '').trim()
-    if (!s) return ''
-    const cleaned = s.replaceAll('$', '').replaceAll(' ', '').replaceAll(',', '')
-    const n = Number(cleaned)
-    return Number.isFinite(n) ? n : ''
-  }
-
-  function normalizeImportInt(raw, fallback = 0) {
-    const s = String(raw ?? '').trim()
-    const n = Number(s)
-    if (!Number.isFinite(n)) return fallback
-    return Math.trunc(n)
-  }
-
-  function normalizeImportDate(raw) {
-    const s = String(raw ?? '').trim()
-    if (!s) return ''
-    // Esperamos YYYY-MM-DD (como el export). Si viene con tiempo, nos quedamos con la parte de fecha.
-    const m = s.match(/^\d{4}-\d{2}-\d{2}/)
-    if (m) return m[0]
-    return s
-  }
-
-  function normalizeImportChannel(raw) {
-    const s = String(raw ?? '').trim()
-    if (CHANNELS.includes(s)) return s
-    const upper = s.toUpperCase()
-    const found = CHANNELS.find((c) => c.toUpperCase() === upper)
-    return found || s
-  }
-
-  async function handleImportCsvFile(file) {
-    setError('')
-    if (!file) return
-
-    try {
-      const text = await file.text()
-      const parsed = parseCsvText(text)
-      const recs = parsed.rows
-
-      if (!recs.length) {
-        setError('El CSV está vacío o no tiene filas de datos.')
-        return
-      }
-
-      const importedRows = recs.map((r) => {
-        const año = normalizeImportInt(r['Año'], filters.year)
-        const mes = normalizeImportInt(r['Mes'], filters.month === 'all' ? 1 : Number(filters.month))
-        const semanaDelMes = normalizeImportInt(r['Semana del mes'], 1)
-
-        return {
-          id: makeId(),
-          año,
-          mes,
-          semanaDelMes,
-          fechaInicioSemana: normalizeImportDate(r['Fecha inicio semana']),
-          fechaFinSemana: normalizeImportDate(r['Fecha fin semana']),
-          canal: normalizeImportChannel(r['Canal'] || (filters.channel === 'all' ? CHANNELS[0] : filters.channel)),
-          inversion: normalizeImportNumber(r['Inversión ($)']),
-          leads: normalizeImportOptionalNumber(r['Leads']),
-          clientesNuevos: normalizeImportNumber(r['Clientes nuevos']),
-          numeroVentas: normalizeImportNumber(r['Número de ventas']),
-          ingresos: normalizeImportNumber(r['Ingresos ($)']),
-          notas: String(r['Notas'] ?? '').trim(),
-        }
-      })
-
-      // Merge: si ya existe una fila con (año, mes, semanaDelMes, canal) la actualizamos con lo importado.
-      const keyOf = (r) => `${Number(r.año)}-${Number(r.mes)}-${Number(r.semanaDelMes)}-${String(r.canal)}`
-      const existingByKey = new Map(rows.map((r) => [keyOf(r), r]))
-
-      const merged = [...rows]
-      let updated = 0
-      let added = 0
-      const changed = []
-
-      for (const ir of importedRows) {
-        const k = keyOf(ir)
-        const existing = existingByKey.get(k)
-        if (existing) {
-          const nextExisting = {
-            ...existing,
-            ...ir,
-            id: existing.id,
-          }
-          const idx = merged.findIndex((x) => x.id === existing.id)
-          if (idx >= 0) merged[idx] = nextExisting
-          existingByKey.set(k, nextExisting)
-          updated++
-          changed.push(nextExisting)
-        } else {
-          merged.push(ir)
-          existingByKey.set(k, ir)
-          added++
-          changed.push(ir)
-        }
-      }
-
-      const sorted = sortRows(merged)
-      setRows(sorted)
-
-      // Preview-only: NO guardamos aún. Se habilita botón "Guardar en base de datos".
-      setPendingImport({ changedRows: changed, added, updated })
-      setError(`CSV cargado. Agregadas: ${added}. Actualizadas: ${updated}. Revisa la tabla y luego guarda.`)
-    } catch {
-      setError('No se pudo importar el CSV. Verifica el formato (usa el CSV exportado por la app).')
-    } finally {
-      // permite re-importar el mismo archivo
-      if (csvFileInputRef.current) csvFileInputRef.current.value = ''
-    }
-  }
-
-  async function handleSaveImportToDb() {
-    if (!pendingImport || !pendingImport.changedRows || pendingImport.changedRows.length === 0) {
-      setError('No hay cambios importados pendientes para guardar.')
-      return
-    }
-
-    setError('')
-    try {
-      const payload = pendingImport.changedRows.map((r) => ({ id: r.id, row: r }))
-      const { error: upsertError } = await supabase.from('weekly_rows').upsert(payload, { onConflict: 'id' })
-      if (upsertError) throw upsertError
-      setPendingImport(null)
-      setError('Cambios guardados en la base de datos.')
-    } catch {
-      setError('No se pudieron guardar los cambios en Supabase.')
-    }
-  }
-
   function handlePrint() {
     window.print()
   }
@@ -554,6 +439,23 @@ export default function App() {
     const mset = new Set(rows.filter((r) => Number(r.año) === Number(filters.year)).map((r) => Number(r.mes)))
     return mset.size >= 2
   }, [rows, filters.year])
+
+  const newRowDefaults = useMemo(() => {
+    return {
+      año: filters.year,
+      mes: filters.month === 'all' ? 1 : Number(filters.month),
+      semanaDelMes: 1,
+      fechaInicioSemana: '',
+      fechaFinSemana: '',
+      canal: filters.channel === 'all' ? CHANNELS[0] : filters.channel,
+      inversion: 0,
+      leads: '',
+      clientesNuevos: 0,
+      numeroVentas: 0,
+      ingresos: 0,
+      notas: '',
+    }
+  }, [filters.year, filters.month, filters.channel])
 
   useEffect(() => {
     // Comentario clave: Ajuste automático de meses comparativos si no existen en el dataset
@@ -578,201 +480,123 @@ export default function App() {
     )
   }
 
-  if (authFlow) {
-    return (
-      <SetPassword
-        type={authFlow}
-        onDone={() => {
-          setAuthFlow(null)
-          setSession(null)
-          setPostLoginInfo('Contraseña actualizada. Inicia sesión con tu nueva contraseña.')
-        }}
-      />
-    )
-  }
-
-  if (!session) {
-    return (
-      <Login
-        initialInfo={postLoginInfo}
-        onLoggedIn={(s) => {
-          setPostLoginInfo('')
-          setSession(s)
-        }}
-      />
-    )
-  }
+  const isAuthed = Boolean(session)
 
   return (
-    <div className="mx-auto max-w-7xl px-4 py-6">
-      <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight text-slate-900 dark:text-white">Dashboard de Ventas y ROI</h1>
-          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            Rentabilidad por canal y mes con captura semanal.
-          </p>
-        </div>
+    <Routes>
+      <Route path="/" element={<Navigate to="/dashboard" replace />} />
 
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="hidden text-sm text-slate-500 dark:text-slate-400 md:block">
-            {session?.user?.email ? session.user.email : 'Sesión activa'}
-          </div>
-          <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-800 dark:bg-slate-950">
-            <button
-              type="button"
-              onClick={() => setView('dashboard')}
-              className={
-                'rounded-lg px-3 py-2 text-sm font-medium ' +
-                (view === 'dashboard'
-                  ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
-                  : 'text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-900')
-              }
-            >
-              Dashboard
-            </button>
-            <button
-              type="button"
-              onClick={() => setView('records')}
-              className={
-                'rounded-lg px-3 py-2 text-sm font-medium ' +
-                (view === 'records'
-                  ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
-                  : 'text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-900')
-              }
-            >
-              Registros
-            </button>
-          </div>
-
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
-          >
-            Salir
-          </button>
-
-          {view === 'records' && (
-            <>
-              <input
-                ref={csvFileInputRef}
-                type="file"
-                accept=".csv,text/csv"
-                className="hidden"
-                onChange={(e) => handleImportCsvFile(e.target.files?.[0] || null)}
-              />
-              <button
-                type="button"
-                onClick={() => csvFileInputRef.current?.click()}
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
-              >
-                Importar CSV
-              </button>
-              <button
-                type="button"
-                onClick={handleSaveImportToDb}
-                disabled={!pendingImport || !pendingImport.changedRows || pendingImport.changedRows.length === 0}
-                className="rounded-xl bg-brand-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-60"
-              >
-                Guardar en base de datos
-              </button>
-              <button
-                type="button"
-                onClick={handleExportCsv}
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
-              >
-                Exportar CSV
-              </button>
-              <button
-                type="button"
-                onClick={handlePrint}
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
-              >
-                Imprimir
-              </button>
-            </>
-          )}
-        </div>
-      </div>
-
-      <FilterBar
-        year={filters.year}
-        years={years}
-        month={filters.month}
-        channel={filters.channel}
-        onChange={(patch) => setFilters((f) => ({ ...f, ...patch }))}
-        darkMode={darkMode}
-        onToggleDark={() => setDarkMode((d) => !d)}
+      <Route
+        path="/login"
+        element={
+          isAuthed ? (
+            <Navigate to="/dashboard" replace />
+          ) : (
+            <Login
+              initialInfo={postLoginInfo}
+              onLoggedIn={(s) => {
+                setPostLoginInfo('')
+                setSession(s)
+                navigate('/dashboard', { replace: true })
+              }}
+            />
+          )
+        }
       />
 
-      {error && (
-        <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-200">
-          {error}
-        </div>
-      )}
+      <Route
+        path="/establecer-contraseña"
+        element={
+          authFlow ? (
+            <SetPassword
+              type={authFlow}
+              onDone={() => {
+                setAuthFlow(null)
+                setSession(null)
+                setPostLoginInfo('Contraseña actualizada. Inicia sesión con tu nueva contraseña.')
+                navigate('/login', { replace: true })
+              }}
+            />
+          ) : (
+            <Navigate to={isAuthed ? '/dashboard' : '/login'} replace />
+          )
+        }
+      />
 
-      <div className="mt-4">
-        {loading ? (
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 text-sm text-slate-600 shadow-soft dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
-            Cargando datos...
-          </div>
-        ) : (
-          <>
-            {view === 'dashboard' && (
-              <>
-                <KPICards currentAgg={currentAgg} previousAgg={previousAgg} />
+      <Route
+        element={
+          isAuthed ? (
+            <AppLayout
+              session={session}
+              onLogout={handleLogout}
+              filters={filters}
+              years={years}
+              onChangeFilters={(patch) => setFilters((f) => ({ ...f, ...patch }))}
+              darkMode={darkMode}
+              onToggleDark={() => setDarkMode((d) => !d)}
+              headerRight={null}
+              error={error}
+              loading={loading}
+            />
+          ) : (
+            <Navigate to="/login" replace />
+          )
+        }
+      >
+        <Route
+          path="/dashboard"
+          element={
+            <DashboardPage
+              currentAgg={currentAgg}
+              previousAgg={previousAgg}
+              weeklySeries={weeklySeries}
+              roiBars={roiBars}
+              pieData={pieData}
+              rankingRows={rankingRows}
+              canCompare={canCompare}
+              year={filters.year}
+              rows={rows}
+              compare={compare}
+              onChangeCompare={(patch) => setCompare((c) => ({ ...c, ...patch }))}
+              onGoToRegistros={() => navigate('/registros')}
+            />
+          }
+        />
 
-                <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
-                  <TrendChart data={weeklySeries} />
-                  <ChannelROIChart data={roiBars} />
-                </div>
+        <Route
+          path="/registros"
+          element={
+            <RegistrosPage
+              rows={filteredRows}
+              newRowDefaults={newRowDefaults}
+              onCreate={handleCreateRow}
+              onPatchRow={handlePatchRow}
+              onTrash={handleTrashRow}
+              onExportCsv={handleExportCsv}
+              onPrint={handlePrint}
+            />
+          }
+        />
 
-                <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-2">
-                  <DistributionPie data={pieData} />
-                  <ChannelRanking rows={rankingRows} />
-                </div>
+        <Route
+          path="/papelera"
+          element={
+            <PapeleraPage
+              rows={trashedRows}
+              onRestore={handleRestoreRow}
+              onDeletePermanent={handleDeleteRowPermanent}
+            />
+          }
+        />
 
-                <div className="mt-4">
-                  <button
-                    type="button"
-                    onClick={() => setView('records')}
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 dark:hover:bg-slate-900"
-                  >
-                    Ver registros con estos filtros
-                  </button>
-                </div>
+        <Route path="/clientes" element={<ClientesPage />} />
 
-                {canCompare && (
-                  <div className="mt-4">
-                    <Comparison
-                      year={filters.year}
-                      rows={rows}
-                      month1={compare.month1}
-                      month2={compare.month2}
-                      onChange={(patch) => setCompare((c) => ({ ...c, ...patch }))}
-                    />
-                  </div>
-                )}
-              </>
-            )}
+        <Route path="/clientes/:id" element={<ClienteDetailPage />} />
 
-            {view === 'records' && (
-              <div className="mt-4">
-                <DataTable rows={filteredRows} onAdd={handleAddRow} onUpdate={handleUpdateRow} onDelete={handleDeleteRow} />
-                <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                  {/* Comentario clave: La tabla se edita con el dataset completo, pero se muestra filtrada */}
-                  Nota: La edición se guarda en el dataset global; la tabla muestra las filas según filtros.
-                </div>
-              </div>
-            )}
-          </>
-        )}
-      </div>
+        <Route path="/usuarios" element={<UsuariosPage accessToken={session?.access_token || ''} />} />
+      </Route>
 
-      <footer className="mt-8 text-xs text-slate-500 dark:text-slate-400">
-        Persistencia: <code className="rounded bg-slate-100 px-1 py-0.5 dark:bg-slate-900">window.storage</code> · Key:{' '}
-        <code className="rounded bg-slate-100 px-1 py-0.5 dark:bg-slate-900">{STORAGE_KEY}</code>
-      </footer>
-    </div>
+      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+    </Routes>
   )
 }
