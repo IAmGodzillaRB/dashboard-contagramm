@@ -66,6 +66,19 @@ function groupWeekly(rows) {
   return [...map.values()].sort((a, b) => String(a.key).localeCompare(String(b.key)))
 }
 
+function formatMonthLabel(month) {
+  const m = Number(month)
+  if (!Number.isFinite(m) || m < 1 || m > 12) return ''
+  return `M${m}`
+}
+
+function monthFromDate(yyyyMmDd) {
+  if (!yyyyMmDd) return null
+  const s = String(yyyyMmDd).slice(0, 10)
+  const m = Number(s.slice(5, 7))
+  return Number.isFinite(m) ? m : null
+}
+
 function groupByChannel(rows) {
   const map = new Map()
   for (const r of rows) {
@@ -95,6 +108,7 @@ export default function App() {
   const [sessionLoading, setSessionLoading] = useState(true)
   const [postLoginInfo, setPostLoginInfo] = useState('')
   const [rows, setRows] = useState([])
+  const [crmMovs, setCrmMovs] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -201,21 +215,26 @@ export default function App() {
       setError('')
 
       try {
-        const { data, error: fetchError } = await supabase
-          .from('weekly_rows')
-          .select('id,row')
-          .order('created_at', { ascending: false })
+        const [weeklyRes, crmRes] = await Promise.all([
+          supabase.from('weekly_rows').select('id,row').order('created_at', { ascending: false }),
+          supabase
+            .from('movimientos_cliente')
+            .select('id,cliente_id,fecha,tipo_movimiento,estado,monto,canal_atribucion,created_at')
+            .order('fecha', { ascending: false })
+            .order('created_at', { ascending: false }),
+        ])
 
-        if (fetchError) throw fetchError
+        if (weeklyRes.error) throw weeklyRes.error
+        if (crmRes.error) throw crmRes.error
         if (!mounted) return
 
-        const fetchedRows = (data || []).map((r) => r.row).filter(Boolean)
-
-        // Si la BD está vacía, el dashboard queda vacío (sin datos de prueba).
+        const fetchedRows = (weeklyRes.data || []).map((r) => r.row).filter(Boolean)
         setRows(sortRows(fetchedRows))
+        setCrmMovs((crmRes.data || []).filter((m) => !m?.deletedAt))
       } catch {
         if (!mounted) return
         setRows([])
+        setCrmMovs([])
         setError('No se pudo cargar Supabase. Verifica conexión/permisos.')
       } finally {
         if (!mounted) return
@@ -272,6 +291,26 @@ export default function App() {
 
   const previousPeriod = useMemo(() => computePreviousPeriod(filters.year, filters.month), [filters.year, filters.month])
 
+  function getDateRange(year, month) {
+    const y = Number(year)
+    if (month === 'all') {
+      const start = new Date(Date.UTC(y, 0, 1))
+      const end = new Date(Date.UTC(y, 11, 31))
+      return { start, end }
+    }
+
+    const m = Number(month)
+    const start = new Date(Date.UTC(y, m - 1, 1))
+    const end = new Date(Date.UTC(y, m, 0))
+    return { start, end }
+  }
+
+  function isDateInRange(yyyyMmDd, range) {
+    if (!yyyyMmDd) return false
+    const d = new Date(`${String(yyyyMmDd).slice(0, 10)}T00:00:00.000Z`)
+    return d >= range.start && d <= range.end
+  }
+
   const previousRows = useMemo(() => {
     return activeRows.filter((r) => {
       if (Number(r.año) !== Number(previousPeriod.year)) return false
@@ -286,18 +325,315 @@ export default function App() {
 
   const weeklySeries = useMemo(() => groupWeekly(filteredRows), [filteredRows])
 
+  const crmAggCurrent = useMemo(() => {
+    const range = getDateRange(filters.year, filters.month)
+
+    const confirmed = crmMovs.filter((m) => m.estado === 'confirmado')
+    const ventas = confirmed.filter((m) => m.tipo_movimiento === 'venta')
+    const reembolsos = confirmed.filter((m) => m.tipo_movimiento === 'reembolso')
+
+    const ventasInRange = ventas.filter((m) => {
+      if (!isDateInRange(m.fecha, range)) return false
+      if (filters.channel !== 'all' && m.canal_atribucion !== filters.channel) return false
+      return true
+    })
+    const reembolsosInRange = reembolsos.filter((m) => {
+      if (!isDateInRange(m.fecha, range)) return false
+      if (filters.channel !== 'all' && m.canal_atribucion !== filters.channel) return false
+      return true
+    })
+
+    const ingresosBruto = ventasInRange.reduce((acc, m) => acc + safeNumber(m.monto), 0)
+    const totalReembolsos = reembolsosInRange.reduce((acc, m) => acc + safeNumber(m.monto), 0)
+    const ingresosNetos = ingresosBruto - totalReembolsos
+
+    const numVentas = ventasInRange.length
+
+    const firstVentaByCliente = new Map()
+    for (const v of ventas) {
+      if (!v.cliente_id || !v.fecha) continue
+      const key = v.cliente_id
+      const existing = firstVentaByCliente.get(key)
+      if (!existing) {
+        firstVentaByCliente.set(key, v)
+        continue
+      }
+      const cmp = String(v.fecha).localeCompare(String(existing.fecha))
+      if (cmp < 0) {
+        firstVentaByCliente.set(key, v)
+      } else if (cmp === 0) {
+        const c2 = String(v.created_at || '').localeCompare(String(existing.created_at || ''))
+        if (c2 < 0) firstVentaByCliente.set(key, v)
+      }
+    }
+
+    let clientesNuevos = 0
+    for (const first of firstVentaByCliente.values()) {
+      if (!isDateInRange(first.fecha, range)) continue
+      if (filters.channel !== 'all' && first.canal_atribucion !== filters.channel) continue
+      clientesNuevos += 1
+    }
+
+    const ticketPromedio = numVentas > 0 ? ingresosBruto / numVentas : 0
+
+    return {
+      inversion: 0,
+      ingresos: ingresosNetos,
+      ingresosBruto,
+      reembolsos: totalReembolsos,
+      leads: 0,
+      clientesNuevos,
+      numeroVentas: numVentas,
+      roi: 0,
+      cac: 0,
+      ticketPromedio,
+    }
+  }, [crmMovs, filters.year, filters.month, filters.channel])
+
+  const crmAggPrevious = useMemo(() => {
+    const range = getDateRange(previousPeriod.year, previousPeriod.month)
+
+    const confirmed = crmMovs.filter((m) => m.estado === 'confirmado')
+    const ventas = confirmed.filter((m) => m.tipo_movimiento === 'venta')
+    const reembolsos = confirmed.filter((m) => m.tipo_movimiento === 'reembolso')
+
+    const ventasInRange = ventas.filter((m) => {
+      if (!isDateInRange(m.fecha, range)) return false
+      if (filters.channel !== 'all' && m.canal_atribucion !== filters.channel) return false
+      return true
+    })
+    const reembolsosInRange = reembolsos.filter((m) => {
+      if (!isDateInRange(m.fecha, range)) return false
+      if (filters.channel !== 'all' && m.canal_atribucion !== filters.channel) return false
+      return true
+    })
+
+    const ingresosBruto = ventasInRange.reduce((acc, m) => acc + safeNumber(m.monto), 0)
+    const totalReembolsos = reembolsosInRange.reduce((acc, m) => acc + safeNumber(m.monto), 0)
+    const ingresosNetos = ingresosBruto - totalReembolsos
+
+    const numVentas = ventasInRange.length
+
+    const firstVentaByCliente = new Map()
+    for (const v of ventas) {
+      if (!v.cliente_id || !v.fecha) continue
+      const key = v.cliente_id
+      const existing = firstVentaByCliente.get(key)
+      if (!existing) {
+        firstVentaByCliente.set(key, v)
+        continue
+      }
+      const cmp = String(v.fecha).localeCompare(String(existing.fecha))
+      if (cmp < 0) {
+        firstVentaByCliente.set(key, v)
+      } else if (cmp === 0) {
+        const c2 = String(v.created_at || '').localeCompare(String(existing.created_at || ''))
+        if (c2 < 0) firstVentaByCliente.set(key, v)
+      }
+    }
+
+    let clientesNuevos = 0
+    for (const first of firstVentaByCliente.values()) {
+      if (!isDateInRange(first.fecha, range)) continue
+      if (filters.channel !== 'all' && first.canal_atribucion !== filters.channel) continue
+      clientesNuevos += 1
+    }
+
+    const ticketPromedio = numVentas > 0 ? ingresosBruto / numVentas : 0
+
+    return {
+      inversion: 0,
+      ingresos: ingresosNetos,
+      ingresosBruto,
+      reembolsos: totalReembolsos,
+      leads: 0,
+      clientesNuevos,
+      numeroVentas: numVentas,
+      roi: 0,
+      cac: 0,
+      ticketPromedio,
+    }
+  }, [crmMovs, previousPeriod.year, previousPeriod.month, filters.channel])
+
+  const crmSeries = useMemo(() => {
+    const confirmed = crmMovs.filter((m) => m.estado === 'confirmado')
+    const ventas = confirmed.filter((m) => m.tipo_movimiento === 'venta')
+    const reembolsos = confirmed.filter((m) => m.tipo_movimiento === 'reembolso')
+
+    const range = getDateRange(filters.year, filters.month)
+
+    const byKey = new Map()
+    const useDaily = filters.month !== 'all'
+
+    const add = (key, label, field, amount) => {
+      if (!byKey.has(key)) byKey.set(key, { key, label, inversion: 0, ingresos: 0 })
+      const row = byKey.get(key)
+      row[field] += amount
+    }
+
+    for (const v of ventas) {
+      if (!isDateInRange(v.fecha, range)) continue
+      if (filters.channel !== 'all' && v.canal_atribucion !== filters.channel) continue
+
+      const k = useDaily ? String(v.fecha).slice(0, 10) : String(monthFromDate(v.fecha) || '')
+      const label = useDaily ? String(v.fecha).slice(8, 10) : formatMonthLabel(monthFromDate(v.fecha))
+      add(k, label, 'ingresos', safeNumber(v.monto))
+    }
+
+    for (const r of reembolsos) {
+      if (!isDateInRange(r.fecha, range)) continue
+      if (filters.channel !== 'all' && r.canal_atribucion !== filters.channel) continue
+
+      const k = useDaily ? String(r.fecha).slice(0, 10) : String(monthFromDate(r.fecha) || '')
+      const label = useDaily ? String(r.fecha).slice(8, 10) : formatMonthLabel(monthFromDate(r.fecha))
+      add(k, label, 'ingresos', -safeNumber(r.monto))
+    }
+
+    return [...byKey.values()].sort((a, b) => String(a.key).localeCompare(String(b.key)))
+  }, [crmMovs, filters.year, filters.month, filters.channel])
+
+  const crmChannelAgg = useMemo(() => {
+    const range = getDateRange(filters.year, filters.month)
+
+    const confirmed = crmMovs.filter((m) => m.estado === 'confirmado')
+    const ventasAll = confirmed.filter((m) => m.tipo_movimiento === 'venta')
+    const reembolsosAll = confirmed.filter((m) => m.tipo_movimiento === 'reembolso')
+
+    const ventas = ventasAll.filter((m) => {
+      if (!isDateInRange(m.fecha, range)) return false
+      if (filters.channel !== 'all' && m.canal_atribucion !== filters.channel) return false
+      return true
+    })
+    const reembolsos = reembolsosAll.filter((m) => {
+      if (!isDateInRange(m.fecha, range)) return false
+      if (filters.channel !== 'all' && m.canal_atribucion !== filters.channel) return false
+      return true
+    })
+
+    const byChannel = new Map()
+    const ensure = (c) => {
+      if (!byChannel.has(c)) {
+        byChannel.set(c, {
+          canal: c,
+          inversion: 0,
+          ingresos: 0,
+          ingresosBruto: 0,
+          reembolsos: 0,
+          leads: 0,
+          clientesNuevos: 0,
+          numeroVentas: 0,
+          roi: 0,
+          roas: 0,
+          rentabilidad: 0,
+        })
+      }
+      return byChannel.get(c)
+    }
+
+    for (const v of ventas) {
+      const c = v.canal_atribucion
+      const agg = ensure(c)
+      agg.ingresosBruto += safeNumber(v.monto)
+      agg.ingresos += safeNumber(v.monto)
+      agg.numeroVentas += 1
+    }
+
+    for (const r of reembolsos) {
+      const c = r.canal_atribucion
+      const agg = ensure(c)
+      agg.reembolsos += safeNumber(r.monto)
+      agg.ingresos -= safeNumber(r.monto)
+    }
+
+    const firstVentaByCliente = new Map()
+    for (const v of ventasAll) {
+      if (!v.cliente_id || !v.fecha) continue
+      const key = v.cliente_id
+      const existing = firstVentaByCliente.get(key)
+      if (!existing) {
+        firstVentaByCliente.set(key, v)
+        continue
+      }
+      const cmp = String(v.fecha).localeCompare(String(existing.fecha))
+      if (cmp < 0) {
+        firstVentaByCliente.set(key, v)
+      } else if (cmp === 0) {
+        const c2 = String(v.created_at || '').localeCompare(String(existing.created_at || ''))
+        if (c2 < 0) firstVentaByCliente.set(key, v)
+      }
+    }
+
+    for (const first of firstVentaByCliente.values()) {
+      if (!isDateInRange(first.fecha, range)) continue
+      if (filters.channel !== 'all' && first.canal_atribucion !== filters.channel) continue
+      const agg = ensure(first.canal_atribucion)
+      agg.clientesNuevos += 1
+    }
+
+    return CHANNELS.map((c) => byChannel.get(c) || {
+      canal: c,
+      inversion: 0,
+      ingresos: 0,
+      ingresosBruto: 0,
+      reembolsos: 0,
+      leads: 0,
+      clientesNuevos: 0,
+      numeroVentas: 0,
+      roi: 0,
+      roas: 0,
+      rentabilidad: 0,
+    })
+  }, [crmMovs, filters.year, filters.month, filters.channel])
+
+  const crmRoiBars = useMemo(() => {
+    return [...crmChannelAgg]
+      .map((r) => ({
+        ...r,
+        metricLabel: 'Ingresos netos',
+        metricValue: safeNumber(r.ingresos),
+      }))
+      .sort((a, b) => safeNumber(b.metricValue) - safeNumber(a.metricValue))
+  }, [crmChannelAgg])
+
+  const crmPieData = useMemo(() => {
+    const total = crmChannelAgg.reduce((acc, r) => acc + safeNumber(r.ingresosBruto), 0)
+    return crmChannelAgg
+      .filter((r) => safeNumber(r.ingresosBruto) > 0)
+      .map((r) => ({ ...r, inversion: safeNumber(r.ingresosBruto), pct: total > 0 ? (safeNumber(r.ingresosBruto) / total) * 100 : 0 }))
+      .sort((a, b) => safeNumber(b.inversion) - safeNumber(a.inversion))
+  }, [crmChannelAgg])
+
+  const crmRankingRows = useMemo(() => {
+    return [...crmChannelAgg].sort((a, b) => safeNumber(b.ingresos) - safeNumber(a.ingresos))
+  }, [crmChannelAgg])
+
   const channelAgg = useMemo(() => {
     const all = groupByChannel(filteredRows)
-    const withEmpty = CHANNELS.map((c) => all.find((x) => x.canal === c) || { canal: c, inversion: 0, ingresos: 0, clientesNuevos: 0, leads: 0, numeroVentas: 0, roi: 0, roas: 0, rentabilidad: 0 })
+    const withEmpty = CHANNELS.map(
+      (c) =>
+        all.find((x) => x.canal === c) || {
+          canal: c,
+          inversion: 0,
+          ingresos: 0,
+          clientesNuevos: 0,
+          leads: 0,
+          numeroVentas: 0,
+          roi: 0,
+          roas: 0,
+          rentabilidad: 0,
+        },
+    )
     return withEmpty
   }, [filteredRows])
 
   const roiBars = useMemo(() => {
     return [...channelAgg]
       .map((r) => {
-        const metricLabel = IS_META_ADS_CHANNEL(r.canal) ? 'ROAS' : 'ROI'
-        const metricValue = IS_META_ADS_CHANNEL(r.canal) ? r.roas : r.roi
-        return { canal: r.canal, metricLabel, metricValue }
+        return {
+          ...r,
+          metricLabel: IS_META_ADS_CHANNEL(r.canal) ? 'ROAS' : 'ROI',
+          metricValue: r.rentabilidad,
+        }
       })
       .sort((a, b) => safeNumber(b.metricValue) - safeNumber(a.metricValue))
   }, [channelAgg])
@@ -549,10 +885,16 @@ export default function App() {
             <DashboardPage
               currentAgg={currentAgg}
               previousAgg={previousAgg}
+              crmAggCurrent={crmAggCurrent}
+              crmAggPrevious={crmAggPrevious}
               weeklySeries={weeklySeries}
+              crmSeries={crmSeries}
               roiBars={roiBars}
+              crmRoiBars={crmRoiBars}
               pieData={pieData}
+              crmPieData={crmPieData}
               rankingRows={rankingRows}
+              crmRankingRows={crmRankingRows}
               canCompare={canCompare}
               year={filters.year}
               rows={rows}

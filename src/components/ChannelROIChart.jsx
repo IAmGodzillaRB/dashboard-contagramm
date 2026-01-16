@@ -29,9 +29,9 @@ function CustomTooltip({ active, payload }) {
   )
 }
 
-export default function ChannelROIChart({ data }) {
+export default function ChannelROIChart({ data, title = 'ROI/ROAS por canal', right = 'Ordenado por rentabilidad' }) {
   return (
-    <Card title="ROI/ROAS por canal" right="Ordenado por rentabilidad">
+    <Card title={title} right={right}>
       <div className="h-72 w-full">
         <ResponsiveContainer width="100%" height="100%">
           <BarChart

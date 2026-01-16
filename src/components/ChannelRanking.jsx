@@ -10,9 +10,9 @@ function scoreClass(value) {
   return 'text-rose-600'
 }
 
-export default function ChannelRanking({ rows }) {
+export default function ChannelRanking({ rows, title = 'Ranking de canales', right = 'Mejor a peor (mes seleccionado)' }) {
   return (
-    <Card title="Ranking de canales" right="Mejor a peor (mes seleccionado)">
+    <Card title={title} right={right}>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[720px] border-separate border-spacing-y-2">
           <thead>
