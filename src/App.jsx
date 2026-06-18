@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Login from './components/Login.jsx'
 import SetPassword from './components/SetPassword.jsx'
 import AppLayout from './layout/AppLayout.jsx'
@@ -103,13 +104,11 @@ function groupByChannel(rows) {
 
 export default function App() {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
 
   const [session, setSession] = useState(null)
   const [sessionLoading, setSessionLoading] = useState(true)
   const [postLoginInfo, setPostLoginInfo] = useState('')
-  const [rows, setRows] = useState([])
-  const [crmMovs, setCrmMovs] = useState([])
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
   const [authFlow, setAuthFlow] = useState(null)
@@ -119,6 +118,73 @@ export default function App() {
   const [darkMode, setDarkMode] = useState(false)
 
   const saveTimersById = useRef({})
+
+  const weeklyRowsQuery = useQuery({
+    queryKey: ['weekly_rows', session?.user?.id || 'anon'],
+    enabled: Boolean(session),
+    queryFn: async () => {
+      const { data, error: e } = await supabase.from('weekly_rows').select('*').order('created_at', { ascending: false })
+      if (e) throw e
+      return sortRows(data || [])
+    },
+  })
+
+  const clientesQuery = useQuery({
+    queryKey: ['clientes', session?.user?.id || 'anon'],
+    enabled: Boolean(session),
+    queryFn: async () => {
+      const { data, error: e } = await supabase.from('clientes').select('id,created_at,canal_origen,estado,deleted_at').order('created_at', { ascending: false })
+      if (e) throw e
+      return data || []
+    },
+  })
+
+  const crmMovsQuery = useQuery({
+    queryKey: ['movimientos_cliente', session?.user?.id || 'anon'],
+    enabled: Boolean(session),
+    queryFn: async () => {
+      const { data, error: e } = await supabase
+        .from('movimientos_cliente')
+        .select('id,cliente_id,fecha,tipo_movimiento,estado,monto,canal_atribucion,created_at,deletedAt')
+        .order('fecha', { ascending: false })
+        .order('created_at', { ascending: false })
+      if (e) throw e
+      return (data || []).filter((m) => !m?.deletedAt)
+    },
+  })
+
+  const rows = weeklyRowsQuery.data || []
+  const clientes = (clientesQuery.data || []).filter((c) => !c?.deleted_at)
+  const crmMovs = crmMovsQuery.data || []
+  const loading = Boolean(session) && (weeklyRowsQuery.isLoading || crmMovsQuery.isLoading || clientesQuery.isLoading)
+  const loadError = (weeklyRowsQuery.error || crmMovsQuery.error || clientesQuery.error)
+    ? 'No se pudo cargar Supabase. Verifica conexión/permisos.'
+    : ''
+
+
+
+  function toRowDate(value) {
+    if (!value) return null
+    const s = String(value).slice(0, 10)
+    if (!s) return null
+    const d = new Date(`${s}T00:00:00.000Z`)
+    return Number.isNaN(d.getTime()) ? null : d
+  }
+
+  function getRowRange(r) {
+    const start = toRowDate(r?.fechaInicioSemana)
+    const end = toRowDate(r?.fechaFinSemana)
+    if (!start || !end) return null
+    return { start, end }
+  }
+
+  function setRowsCache(updater) {
+    queryClient.setQueryData(['weekly_rows', session?.user?.id || 'anon'], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      const next = typeof updater === 'function' ? updater(base) : base
+      return sortRows(next)
+    })
+  }
 
   useEffect(() => {
     let mounted = true
@@ -207,47 +273,12 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    // Persistencia compartida en Supabase: se carga después de iniciar sesión.
-    let mounted = true
-
-    async function loadFromSupabase() {
-      setLoading(true)
-      setError('')
-
-      try {
-        const [weeklyRes, crmRes] = await Promise.all([
-          supabase.from('weekly_rows').select('id,row').order('created_at', { ascending: false }),
-          supabase
-            .from('movimientos_cliente')
-            .select('id,cliente_id,fecha,tipo_movimiento,estado,monto,canal_atribucion,created_at')
-            .order('fecha', { ascending: false })
-            .order('created_at', { ascending: false }),
-        ])
-
-        if (weeklyRes.error) throw weeklyRes.error
-        if (crmRes.error) throw crmRes.error
-        if (!mounted) return
-
-        const fetchedRows = (weeklyRes.data || []).map((r) => r.row).filter(Boolean)
-        setRows(sortRows(fetchedRows))
-        setCrmMovs((crmRes.data || []).filter((m) => !m?.deletedAt))
-      } catch {
-        if (!mounted) return
-        setRows([])
-        setCrmMovs([])
-        setError('No se pudo cargar Supabase. Verifica conexión/permisos.')
-      } finally {
-        if (!mounted) return
-        setLoading(false)
-      }
-    }
-
-    if (session) loadFromSupabase()
-
-    return () => {
-      mounted = false
-    }
+    setError('')
   }, [session])
+
+  useEffect(() => {
+    if (loadError) setError(loadError)
+  }, [loadError])
 
   async function handleLogout() {
     setError('')
@@ -376,19 +407,28 @@ export default function App() {
 
     const ticketPromedio = numVentas > 0 ? ingresosBruto / numVentas : 0
 
+    const leads = clientes.reduce((acc, c) => {
+      if (filters.channel !== 'all' && String(c.canal_origen || '') !== filters.channel) return acc
+      const created = toRowDate(c.created_at)
+      if (!created) return acc
+      return isDateInRange(String(c.created_at).slice(0, 10), range) ? acc + 1 : acc
+    }, 0)
+    const tasaConversion = leads > 0 ? (clientesNuevos / leads) * 100 : 0
+
     return {
       inversion: 0,
       ingresos: ingresosNetos,
       ingresosBruto,
       reembolsos: totalReembolsos,
-      leads: 0,
+      leads,
       clientesNuevos,
       numeroVentas: numVentas,
       roi: 0,
       cac: 0,
       ticketPromedio,
+      tasaConversion,
     }
-  }, [crmMovs, filters.year, filters.month, filters.channel])
+  }, [crmMovs, clientes, filters.year, filters.month, filters.channel])
 
   const crmAggPrevious = useMemo(() => {
     const range = getDateRange(previousPeriod.year, previousPeriod.month)
@@ -441,19 +481,28 @@ export default function App() {
 
     const ticketPromedio = numVentas > 0 ? ingresosBruto / numVentas : 0
 
+    const leads = clientes.reduce((acc, c) => {
+      if (filters.channel !== 'all' && String(c.canal_origen || '') !== filters.channel) return acc
+      const created = toRowDate(c.created_at)
+      if (!created) return acc
+      return isDateInRange(String(c.created_at).slice(0, 10), range) ? acc + 1 : acc
+    }, 0)
+    const tasaConversion = leads > 0 ? (clientesNuevos / leads) * 100 : 0
+
     return {
       inversion: 0,
       ingresos: ingresosNetos,
       ingresosBruto,
       reembolsos: totalReembolsos,
-      leads: 0,
+      leads,
       clientesNuevos,
       numeroVentas: numVentas,
       roi: 0,
       cac: 0,
       ticketPromedio,
+      tasaConversion,
     }
-  }, [crmMovs, previousPeriod.year, previousPeriod.month, filters.channel])
+  }, [crmMovs, clientes, previousPeriod.year, previousPeriod.month, filters.channel])
 
   const crmSeries = useMemo(() => {
     const confirmed = crmMovs.filter((m) => m.estado === 'confirmado')
@@ -669,7 +718,7 @@ export default function App() {
       try {
         const { error: upsertError } = await supabase
           .from('weekly_rows')
-          .upsert({ id: nextRow.id, row: nextRow }, { onConflict: 'id' })
+          .upsert(nextRow, { onConflict: 'id' })
 
         if (upsertError) throw upsertError
       } catch {
@@ -685,58 +734,60 @@ export default function App() {
       ...(draft && typeof draft === 'object' ? draft : {}),
     }
 
-    const next = sortRows([newRow, ...rows])
-    setRows(next)
+    setRowsCache((prev) => [newRow, ...prev])
 
     supabase
       .from('weekly_rows')
-      .insert({ id: newRow.id, row: newRow })
+      .insert(newRow)
       .then(({ error: insertError }) => {
         if (insertError) setError('No se pudo guardar la nueva fila en Supabase.')
       })
   }
 
   function handlePatchRow(id, patch) {
-    const next = rows.map((r) => {
-      if (r.id !== id) return r
-      if (patch && typeof patch === 'object') {
-        return { ...r, ...patch, id: r.id }
-      }
-      return r
+    let updatedRow = null
+    setRowsCache((prev) => {
+      const next = prev.map((r) => {
+        if (r.id !== id) return r
+        const patched = patch && typeof patch === 'object' ? { ...r, ...patch, id: r.id } : r
+        updatedRow = patched
+        return patched
+      })
+      return next
     })
-    const sorted = sortRows(next)
-    setRows(sorted)
-
-    const updatedRow = sorted.find((r) => r.id === id)
     if (updatedRow) scheduleSaveRow(updatedRow)
   }
 
   function handleTrashRow(id) {
     const now = new Date().toISOString()
-    const next = rows.map((r) => (r.id === id ? { ...r, deletedAt: now } : r))
-    const sorted = sortRows(next)
-    setRows(sorted)
-
-    const updatedRow = sorted.find((r) => r.id === id)
+    let updatedRow = null
+    setRowsCache((prev) => {
+      const next = prev.map((r) => {
+        if (r.id !== id) return r
+        updatedRow = { ...r, deletedAt: now }
+        return updatedRow
+      })
+      return next
+    })
     if (updatedRow) scheduleSaveRow(updatedRow)
   }
 
   function handleRestoreRow(id) {
-    const next = rows.map((r) => {
-      if (r.id !== id) return r
-      const { deletedAt: _deletedAt, ...rest } = r
-      return rest
+    let updatedRow = null
+    setRowsCache((prev) => {
+      const next = prev.map((r) => {
+        if (r.id !== id) return r
+        const { deletedAt: _deletedAt, ...rest } = r
+        updatedRow = rest
+        return rest
+      })
+      return next
     })
-    const sorted = sortRows(next)
-    setRows(sorted)
-
-    const updatedRow = sorted.find((r) => r.id === id)
     if (updatedRow) scheduleSaveRow(updatedRow)
   }
 
   function handleDeleteRowPermanent(id) {
-    const next = rows.filter((r) => r.id !== id)
-    setRows(next)
+    setRowsCache((prev) => prev.filter((r) => r.id !== id))
 
     supabase
       .from('weekly_rows')

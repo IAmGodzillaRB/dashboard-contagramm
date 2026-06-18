@@ -1,15 +1,30 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Plus } from 'lucide-react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Card from '../components/ui/Card.jsx'
+import { CHANNELS } from '../constants.js'
 import { supabase } from '../lib/supabaseClient.js'
 
-export default function ClientesPage() {
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
+const MONTHS = [
+  { value: 1, label: 'Enero' },
+  { value: 2, label: 'Febrero' },
+  { value: 3, label: 'Marzo' },
+  { value: 4, label: 'Abril' },
+  { value: 5, label: 'Mayo' },
+  { value: 6, label: 'Junio' },
+  { value: 7, label: 'Julio' },
+  { value: 8, label: 'Agosto' },
+  { value: 9, label: 'Septiembre' },
+  { value: 10, label: 'Octubre' },
+  { value: 11, label: 'Noviembre' },
+  { value: 12, label: 'Diciembre' },
+]
 
-  const [clientes, setClientes] = useState([])
-  const [trashedClientes, setTrashedClientes] = useState([])
+export default function ClientesPage() {
+  const queryClient = useQueryClient()
+
+  const [error, setError] = useState('')
 
   const [query, setQuery] = useState('')
   const [isCreateOpen, setIsCreateOpen] = useState(false)
@@ -18,8 +33,33 @@ export default function ClientesPage() {
   const [showTrash, setShowTrash] = useState(false)
   const [confirmState, setConfirmState] = useState(null)
 
+  const [canalMenu, setCanalMenu] = useState(null)
+
+  const weeklyRowsQuery = useQuery({
+    queryKey: ['weekly_rows'],
+    queryFn: async () => {
+      const { data, error: e } = await supabase.from('weekly_rows').select('*').order('created_at', { ascending: false })
+      if (e) throw e
+      return data || []
+    },
+  })
+
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
+
+  const clientesQuery = useQuery({
+    queryKey: ['clientes'],
+    queryFn: async () => {
+      const { data, error: e } = await supabase.from('clientes').select('*').order('created_at', { ascending: false })
+      if (e) throw e
+      return data || []
+    },
+  })
+
+  const loading = clientesQuery.isLoading
+  const allClientes = clientesQuery.data || []
+  const clientes = useMemo(() => allClientes.filter((c) => !c?.deleted_at), [allClientes])
+  const trashedClientes = useMemo(() => allClientes.filter((c) => c?.deleted_at), [allClientes])
 
   function closeConfirm() {
     setConfirmState(null)
@@ -33,34 +73,65 @@ export default function ClientesPage() {
     setConfirmState({ ...next, rect: safeRect })
   }
 
+  function closeCanalMenu() {
+    setCanalMenu(null)
+  }
+
+  function openCanalMenu(ev) {
+    const rect = ev?.currentTarget?.getBoundingClientRect?.()
+    const safeRect = rect
+      ? { top: rect.top, left: rect.left, width: rect.width, height: rect.height }
+      : { top: 0, left: 0, width: 0, height: 0 }
+    setCanalMenu({ rect: safeRect })
+  }
+
   useEffect(() => {
-    let active = true
+    if (clientesQuery.isError) setError('No se pudieron cargar los clientes.')
+  }, [clientesQuery.isError])
 
-    async function load() {
-      setLoading(true)
-      setError('')
+  useEffect(() => {
+    if (weeklyRowsQuery.isError) setError('No se pudieron cargar los registros.')
+  }, [weeklyRowsQuery.isError])
 
-      const { data, error: e } = await supabase.from('clientes').select('*').order('created_at', { ascending: false })
-      if (!active) return
-      if (e) {
-        setError('No se pudieron cargar los clientes.')
-        setClientes([])
-        setLoading(false)
-        return
-      }
+  const registros = weeklyRowsQuery.data || []
+  const registroYears = useMemo(() => {
+    const ys = [...new Set(registros.map((r) => Number(r.año)).filter((n) => Number.isFinite(n)))].sort((a, b) => a - b)
+    return ys
+  }, [registros])
 
-      const all = data || []
-      setClientes(all.filter((c) => !c?.deletedAt))
-      setTrashedClientes(all.filter((c) => c?.deletedAt))
-      setLoading(false)
+  const registroMonthsByYear = useMemo(() => {
+    const map = new Map()
+    for (const r of registros) {
+      const y = Number(r.año)
+      const m = Number(r.mes)
+      if (!Number.isFinite(y) || !Number.isFinite(m)) continue
+      if (!map.has(y)) map.set(y, new Set())
+      map.get(y).add(m)
     }
+    const out = new Map()
+    for (const [y, set] of map.entries()) out.set(y, [...set].sort((a, b) => a - b))
+    return out
+  }, [registros])
 
-    load()
-
-    return () => {
-      active = false
+  const registroWeeksByYearMonth = useMemo(() => {
+    const map = new Map()
+    for (const r of registros) {
+      const y = Number(r.año)
+      const m = Number(r.mes)
+      const w = Number(r.semanaDelMes)
+      if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(w)) continue
+      const key = `${y}-${m}`
+      if (!map.has(key)) map.set(key, new Set())
+      map.get(key).add(w)
     }
-  }, [])
+    const out = new Map()
+    for (const [key, set] of map.entries()) out.set(key, [...set].sort((a, b) => a - b))
+    return out
+  }, [registros])
+
+  function findRegistroFor(y, m, w) {
+    return registros.find((r) => Number(r.año) === Number(y) && Number(r.mes) === Number(m) && Number(r.semanaDelMes) === Number(w)) || null
+  }
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
@@ -81,74 +152,93 @@ export default function ClientesPage() {
   const pageRows = useMemo(() => {
     const safePage = Math.min(Math.max(1, page), totalPages)
     const start = (safePage - 1) * pageSize
-    return filtered.slice(start, start + pageSize)
+    return filtered?.slice(start, start + pageSize)
   }, [filtered, page, pageSize, totalPages])
 
   async function trashCliente(clienteId) {
-    const target = clientes.find((c) => c.id === clienteId)
+    const target = allClientes?.find((c) => c.id === clienteId)
     if (!target) return
 
     setError('')
-    setClientes((prev) => prev.filter((c) => c.id !== clienteId))
-    setTrashedClientes((prev) => [{ ...target, deletedAt: new Date().toISOString() }, ...prev])
-
     const now = new Date().toISOString()
-    const { error: updErr } = await supabase.from('clientes').update({ deletedAt: now }).eq('id', clienteId)
+    const prevSnapshot = queryClient.getQueryData(['clientes'])
+    queryClient.setQueryData(['clientes'], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      return base.map((c) => (c.id === clienteId ? { ...c, deleted_at: now } : c))
+    })
+
+    const { error: updErr } = await supabase.from('clientes').update({ deleted_at: now }).eq('id', clienteId)
     if (!updErr) return
 
-    const msg = String(updErr.message || '')
-    if (msg.toLowerCase().includes('deletedat') && msg.toLowerCase().includes('does not exist')) {
-      const { error: delErr } = await supabase.from('clientes').delete().eq('id', clienteId)
-      if (delErr) {
-        setError('No se pudo eliminar el cliente.')
-        setClientes((prev) => [target, ...prev])
-        setTrashedClientes((prev) => prev.filter((c) => c.id !== clienteId))
-      }
-      return
-    }
-
     setError('No se pudo enviar a papelera.')
-    setClientes((prev) => [target, ...prev])
-    setTrashedClientes((prev) => prev.filter((c) => c.id !== clienteId))
+    queryClient.setQueryData(['clientes'], prevSnapshot)
   }
 
   async function restoreCliente(clienteId) {
-    const target = trashedClientes.find((c) => c.id === clienteId)
+    const target = allClientes.find((c) => c.id === clienteId)
     if (!target) return
 
     setError('')
-    setTrashedClientes((prev) => prev.filter((c) => c.id !== clienteId))
-    setClientes((prev) => [{ ...target, deletedAt: null }, ...prev])
 
-    const { error: updErr } = await supabase.from('clientes').update({ deletedAt: null }).eq('id', clienteId)
+    const prevSnapshot = queryClient.getQueryData(['clientes'])
+    queryClient.setQueryData(['clientes'], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      return base.map((c) => (c.id === clienteId ? { ...c, deleted_at: null } : c))
+    })
+
+    const { error: updErr } = await supabase.from('clientes').update({ deleted_at: null }).eq('id', clienteId)
     if (!updErr) return
 
     setError('No se pudo restaurar el cliente.')
-    setClientes((prev) => prev.filter((c) => c.id !== clienteId))
-    setTrashedClientes((prev) => [target, ...prev])
+    queryClient.setQueryData(['clientes'], prevSnapshot)
   }
 
   async function deleteClientePermanente(clienteId) {
-    const target = trashedClientes.find((c) => c.id === clienteId)
+    const target = allClientes.find((c) => c.id === clienteId)
     if (!target) return
 
     setError('')
-    setTrashedClientes((prev) => prev.filter((c) => c.id !== clienteId))
+
+    const prevSnapshot = queryClient.getQueryData(['clientes'])
+    queryClient.setQueryData(['clientes'], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      return base.filter((c) => c.id !== clienteId)
+    })
 
     const { error: delErr } = await supabase.from('clientes').delete().eq('id', clienteId)
     if (!delErr) return
 
     setError('No se pudo eliminar permanentemente el cliente.')
-    setTrashedClientes((prev) => [target, ...prev])
+    queryClient.setQueryData(['clientes'], prevSnapshot)
   }
 
   function openCreate() {
-    setDraft({ nombre: '', telefono: '', email: '', estado: 'prospecto', notas: '' })
+    setCanalMenu(null)
+    const now = new Date()
+
+    const defaultYear = registroYears.length ? registroYears[registroYears.length - 1] : now.getFullYear()
+    const defaultMonth = (registroMonthsByYear.get(defaultYear) || [])[0] || (now.getMonth() + 1)
+    const defaultWeek = (registroWeeksByYearMonth.get(`${defaultYear}-${defaultMonth}`) || [])[0] || 1
+    const registro = findRegistroFor(defaultYear, defaultMonth, defaultWeek)
+    const canalFromRegistro = registro ? String(registro.canal || '') : ''
+
+    setDraft({
+      nombre: '',
+      telefono: '',
+      email: '',
+      estado: 'prospecto',
+      canal_origen: canalFromRegistro || (CHANNELS[0] || ''),
+      anio_alta: defaultYear,
+      mes_alta: defaultMonth,
+      semana_alta: defaultWeek,
+      notas: '',
+    })
     setIsCreateOpen(true)
   }
 
   function closeCreate() {
     setIsCreateOpen(false)
+    setCanalMenu(null)
     setDraft(null)
   }
 
@@ -161,6 +251,10 @@ export default function ClientesPage() {
       telefono: String(draft.telefono || '').trim() || null,
       email: String(draft.email || '').trim() || null,
       estado: draft.estado || 'prospecto',
+      canal_origen: String(draft.canal_origen || '').trim() || null,
+      anio_alta: Number(draft.anio_alta) || null,
+      mes_alta: Number(draft.mes_alta) || null,
+      semana_alta: Number(draft.semana_alta) || null,
       notas: String(draft.notas || '').trim() || null,
     }
 
@@ -169,13 +263,34 @@ export default function ClientesPage() {
       return
     }
 
-    const { data, error: insErr } = await supabase.from('clientes').insert(payload).select('*').maybeSingle()
+    let { data, error: insErr } = await supabase.from('clientes').insert(payload).select('*').maybeSingle()
     if (insErr) {
-      setError('No se pudo guardar el cliente.')
+      const msg = String(insErr.message || '')
+      const lowered = msg.toLowerCase()
+      if (lowered.includes('does not exist') || lowered.includes('schema cache') || lowered.includes('column')) {
+        const payloadRetry = { ...payload }
+        delete payloadRetry.canal_origen
+        delete payloadRetry.anio_alta
+        delete payloadRetry.mes_alta
+        delete payloadRetry.semana_alta
+        const retry = await supabase.from('clientes').insert(payloadRetry).select('*').maybeSingle()
+        data = retry.data
+        insErr = retry.error
+      }
+    }
+
+    if (insErr) {
+      const details = String(insErr.details || '')
+      const hint = String(insErr.hint || '')
+      const msg = String(insErr.message || 'No se pudo guardar el cliente.')
+      setError([msg, details, hint].filter(Boolean).join(' | '))
       return
     }
 
-    setClientes((prev) => [data, ...prev])
+    queryClient.setQueryData(['clientes'], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      return [data, ...base]
+    })
     closeCreate()
   }
 
@@ -459,6 +574,105 @@ export default function ClientesPage() {
                   </select>
                 </label>
 
+                <label className="grid gap-1 min-w-0">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Canal de origen</span>
+                  <button
+                    type="button"
+                    onClick={openCanalMenu}
+                    disabled={Boolean(registros.length)}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-sm text-slate-900 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100 dark:hover:bg-slate-900"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 truncate">{draft.canal_origen || '-'}</span>
+                      <span className="text-slate-500 dark:text-slate-400">▾</span>
+                    </div>
+                  </button>
+                </label>
+
+                <label className="grid gap-1">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Año de alta</span>
+                  <select
+                    value={draft.anio_alta}
+                    onChange={(e) => {
+                      const nextYear = Number(e.target.value) || new Date().getFullYear()
+                      const months = registroMonthsByYear.get(nextYear) || []
+                      const nextMonth = months[0] || 1
+                      const weeks = registroWeeksByYearMonth.get(`${nextYear}-${nextMonth}`) || []
+                      const nextWeek = weeks[0] || 1
+                      const registro = findRegistroFor(nextYear, nextMonth, nextWeek)
+                      const canalFromRegistro = registro ? String(registro.canal || '') : ''
+                      setDraft((d) => ({
+                        ...d,
+                        anio_alta: nextYear,
+                        mes_alta: nextMonth,
+                        semana_alta: nextWeek,
+                        canal_origen: canalFromRegistro || d.canal_origen,
+                      }))
+                    }}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
+                  >
+                    {(registroYears.length ? registroYears : [new Date().getFullYear()]).map((y) => (
+                      <option key={y} value={y}>
+                        {y}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="grid gap-1">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Mes de alta</span>
+                  <select
+                    value={draft.mes_alta}
+                    onChange={(e) => {
+                      const nextMonth = Number(e.target.value) || 1
+                      const weeks = registroWeeksByYearMonth.get(`${draft.anio_alta}-${nextMonth}`) || []
+                      const nextWeek = weeks[0] || 1
+                      const registro = findRegistroFor(draft.anio_alta, nextMonth, nextWeek)
+                      const canalFromRegistro = registro ? String(registro.canal || '') : ''
+                      setDraft((d) => ({
+                        ...d,
+                        mes_alta: nextMonth,
+                        semana_alta: nextWeek,
+                        canal_origen: canalFromRegistro || d.canal_origen,
+                      }))
+                    }}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
+                  >
+                    {(registroMonthsByYear.get(Number(draft.anio_alta)) || []).map((m) => {
+                      const label = MONTHS.find((mm) => mm.value === m)?.label || String(m)
+                      return (
+                        <option key={m} value={m}>
+                          {label}
+                        </option>
+                      )
+                    })}
+                  </select>
+                </label>
+
+                <label className="grid gap-1">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Semana de alta (del mes)</span>
+                  <select
+                    value={draft.semana_alta}
+                    onChange={(e) => {
+                      const nextWeek = Number(e.target.value) || 1
+                      const registro = findRegistroFor(draft.anio_alta, draft.mes_alta, nextWeek)
+                      const canalFromRegistro = registro ? String(registro.canal || '') : ''
+                      setDraft((d) => ({
+                        ...d,
+                        semana_alta: nextWeek,
+                        canal_origen: canalFromRegistro || d.canal_origen,
+                      }))
+                    }}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
+                  >
+                    {(registroWeeksByYearMonth.get(`${draft.anio_alta}-${draft.mes_alta}`) || []).map((w) => (
+                      <option key={w} value={w}>
+                        {w}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
                 <label className="grid gap-1">
                   <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Teléfono</span>
                   <input
@@ -508,6 +722,44 @@ export default function ClientesPage() {
           </div>
         </div>
       )}
+
+      {isCreateOpen && draft && canalMenu ? (
+        <div className="fixed inset-0 z-[55]">
+          <button
+            type="button"
+            onClick={closeCanalMenu}
+            className="absolute inset-0 h-full w-full cursor-default bg-transparent"
+          />
+          <div
+            className="fixed"
+            style={{
+              top: (canalMenu.rect?.top ?? 0) + (canalMenu.rect?.height ?? 0) + 8,
+              left: canalMenu.rect?.left ?? 0,
+              width: canalMenu.rect?.width ?? 280,
+            }}
+          >
+            <div className="max-h-60 overflow-auto rounded-2xl border border-slate-200 bg-white p-1 text-sm shadow-soft dark:border-slate-800 dark:bg-slate-950">
+              {CHANNELS.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => {
+                    setDraft((d) => ({ ...d, canal_origen: c }))
+                    closeCanalMenu()
+                  }}
+                  className={
+                    c === draft.canal_origen
+                      ? 'block w-full rounded-xl bg-slate-100 px-3 py-2 text-left font-semibold text-slate-900 dark:bg-slate-900 dark:text-slate-100'
+                      : 'block w-full rounded-xl px-3 py-2 text-left text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-900'
+                  }
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

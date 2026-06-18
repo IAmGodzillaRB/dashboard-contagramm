@@ -1,5 +1,5 @@
 import React from 'react'
-import { ArrowDownRight, ArrowUpRight, DollarSign, Target, TrendingUp, Users, ShoppingCart } from 'lucide-react'
+import { ArrowDownRight, ArrowUpRight, DollarSign, Target, TrendingUp, Users, ShoppingCart, UserPlus, Percent } from 'lucide-react'
 import { formatCurrencyMXN, formatNumber, pctChange, safeNumber } from '../lib/numbers.js'
 
 function Delta({ current, previous, isPercent = true }) {
@@ -49,9 +49,11 @@ export default function KPICards({ currentAgg, previousAgg }) {
   const cac = safeNumber(currentAgg.cac)
   const clientes = safeNumber(currentAgg.clientesNuevos)
   const ticket = safeNumber(currentAgg.ticketPromedio)
+  const leads = safeNumber(currentAgg.leads)
+  const tasaConversion = safeNumber(currentAgg.tasaConversion)
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-6">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
       <KPICard
         title="Inversión Total"
         value={formatCurrencyMXN(inv)}
@@ -93,6 +95,20 @@ export default function KPICards({ currentAgg, previousAgg }) {
         icon={ShoppingCart}
         deltaCurrent={ticket}
         deltaPrevious={previousAgg.ticketPromedio}
+      />
+      <KPICard
+        title="Prospectos Totales"
+        value={formatNumber(leads, 0)}
+        icon={UserPlus}
+        deltaCurrent={leads}
+        deltaPrevious={safeNumber(previousAgg.leads)}
+      />
+      <KPICard
+        title="Tasa de Conversión"
+        value={formatNumber(tasaConversion, 1) + '%'}
+        icon={Percent}
+        deltaCurrent={tasaConversion}
+        deltaPrevious={safeNumber(previousAgg.tasaConversion)}
       />
     </div>
   )

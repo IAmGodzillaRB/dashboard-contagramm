@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, Plus } from 'lucide-react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import Card from '../components/ui/Card.jsx'
 import { CHANNELS } from '../constants.js'
 import { safeNumber } from '../lib/numbers.js'
@@ -26,13 +27,9 @@ function toInputDate(value) {
 export default function ClienteDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
 
-  const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-
-  const [cliente, setCliente] = useState(null)
-  const [movs, setMovs] = useState([])
-  const [trashedMovs, setTrashedMovs] = useState([])
 
   const [isClienteModalOpen, setIsClienteModalOpen] = useState(false)
   const [clienteDraft, setClienteDraft] = useState(null)
@@ -45,11 +42,50 @@ export default function ClienteDetailPage() {
   const [movQuery, setMovQuery] = useState('')
   const [movTipo, setMovTipo] = useState('')
   const [movEstado, setMovEstado] = useState('')
-  const [movCanal, setMovCanal] = useState('')
   const [movPage, setMovPage] = useState(1)
   const [movPageSize, setMovPageSize] = useState(20)
 
   const [confirmState, setConfirmState] = useState(null)
+
+  const [canalMenu, setCanalMenu] = useState(null)
+
+  const clienteQuery = useQuery({
+    queryKey: ['cliente', id],
+    enabled: Boolean(id),
+    queryFn: async () => {
+      const { data, error: e } = await supabase.from('clientes').select('*').eq('id', id).maybeSingle()
+      if (e) throw e
+      return data
+    },
+  })
+
+  const movimientosQuery = useQuery({
+    queryKey: ['movimientos_cliente_por_cliente', id],
+    enabled: Boolean(id),
+    queryFn: async () => {
+      const { data, error: e } = await supabase
+        .from('movimientos_cliente')
+        .select('*')
+        .eq('cliente_id', id)
+        .order('fecha', { ascending: false })
+        .order('created_at', { ascending: false })
+      if (e) throw e
+      return data || []
+    },
+  })
+
+  const loading = clienteQuery.isLoading || movimientosQuery.isLoading
+  const cliente = clienteQuery.data
+  const allMovs = movimientosQuery.data || []
+  const movs = useMemo(() => allMovs.filter((row) => !row?.deletedAt), [allMovs])
+  const trashedMovs = useMemo(() => allMovs.filter((row) => row?.deletedAt), [allMovs])
+
+  const loadError =
+    clienteQuery.isError
+      ? 'No se pudo cargar el cliente.'
+      : movimientosQuery.isError
+        ? 'No se pudieron cargar los movimientos.'
+        : ''
 
   function closeConfirm() {
     setConfirmState(null)
@@ -63,58 +99,31 @@ export default function ClienteDetailPage() {
     setConfirmState({ ...next, rect: safeRect })
   }
 
+  function closeCanalMenu() {
+    setCanalMenu(null)
+  }
+
+  function openCanalMenu(ev) {
+    const rect = ev?.currentTarget?.getBoundingClientRect?.()
+    const safeRect = rect
+      ? { top: rect.top, left: rect.left, width: rect.width, height: rect.height }
+      : { top: 0, left: 0, width: 0, height: 0 }
+    setCanalMenu({ rect: safeRect })
+  }
+
   useEffect(() => {
-    let active = true
-
-    async function load() {
-      setLoading(true)
-      setError('')
-
-      const { data: c, error: cErr } = await supabase.from('clientes').select('*').eq('id', id).maybeSingle()
-      if (!active) return
-      if (cErr) {
-        setError('No se pudo cargar el cliente.')
-        setLoading(false)
-        return
-      }
-
-      const { data: m, error: mErr } = await supabase
-        .from('movimientos_cliente')
-        .select('*')
-        .eq('cliente_id', id)
-        .order('fecha', { ascending: false })
-        .order('created_at', { ascending: false })
-
-      if (!active) return
-      if (mErr) {
-        setError('No se pudieron cargar los movimientos.')
-        setCliente(c)
-        setMovs([])
-        setLoading(false)
-        return
-      }
-
-      setCliente(c)
-      const allMovs = m || []
-      setMovs(allMovs.filter((row) => !row?.deletedAt))
-      setTrashedMovs(allMovs.filter((row) => row?.deletedAt))
-      setLoading(false)
-    }
-
-    load()
-
-    return () => {
-      active = false
-    }
-  }, [id])
+    if (loadError) setError(loadError)
+  }, [loadError])
 
   function openEditClienteModal() {
     if (!cliente) return
+    setCanalMenu(null)
     setClienteDraft({
       nombre: String(cliente.nombre || ''),
       telefono: String(cliente.telefono || ''),
       email: String(cliente.email || ''),
       estado: String(cliente.estado || 'prospecto'),
+      canal_origen: String(cliente.canal_origen || CHANNELS[0] || ''),
       notas: String(cliente.notas || ''),
     })
     setIsClienteModalOpen(true)
@@ -122,6 +131,7 @@ export default function ClienteDetailPage() {
 
   function closeClienteModal() {
     setIsClienteModalOpen(false)
+    setCanalMenu(null)
     setClienteDraft(null)
   }
 
@@ -134,6 +144,7 @@ export default function ClienteDetailPage() {
       telefono: String(clienteDraft.telefono || '').trim() || null,
       email: String(clienteDraft.email || '').trim() || null,
       estado: String(clienteDraft.estado || 'prospecto'),
+      canal_origen: String(clienteDraft.canal_origen || '').trim() || null,
       notas: String(clienteDraft.notas || '').trim() || null,
     }
 
@@ -142,13 +153,29 @@ export default function ClienteDetailPage() {
       return
     }
 
-    const { data, error: updErr } = await supabase.from('clientes').update(payload).eq('id', id).select('*').maybeSingle()
+    const prevSnapshot = queryClient.getQueryData(['cliente', id])
+    queryClient.setQueryData(['cliente', id], (prev) => (prev ? { ...prev, ...payload } : prev))
+
+    let { data, error: updErr } = await supabase.from('clientes').update(payload).eq('id', id).select('*').maybeSingle()
+    if (updErr) {
+      const msg = String(updErr.message || '')
+      if (msg.toLowerCase().includes('canal_origen') && msg.toLowerCase().includes('does not exist')) {
+        const payloadNoCanal = { ...payload }
+        delete payloadNoCanal.canal_origen
+        const retry = await supabase.from('clientes').update(payloadNoCanal).eq('id', id).select('*').maybeSingle()
+        data = retry.data
+        updErr = retry.error
+      }
+    }
+
     if (updErr) {
       setError('No se pudo guardar el cliente.')
+      queryClient.setQueryData(['cliente', id], prevSnapshot)
       return
     }
 
-    setCliente(data)
+    queryClient.setQueryData(['cliente', id], data)
+    queryClient.invalidateQueries({ queryKey: ['clientes'] })
     closeClienteModal()
   }
 
@@ -157,24 +184,33 @@ export default function ClienteDetailPage() {
     setError('')
     const now = new Date().toISOString()
 
-    setCliente((prev) => (prev ? { ...prev, deletedAt: now } : prev))
-    const { error: updErr } = await supabase.from('clientes').update({ deletedAt: now }).eq('id', id)
-    if (!updErr) return
+    const prevSnapshot = queryClient.getQueryData(['cliente', id])
+    queryClient.setQueryData(['cliente', id], (prev) => (prev ? { ...prev, deleted_at: now } : prev))
+    const { error: updErr } = await supabase.from('clientes').update({ deleted_at: now }).eq('id', id)
+    if (!updErr) {
+      queryClient.invalidateQueries({ queryKey: ['clientes'] })
+      return
+    }
 
     setError('No se pudo enviar a papelera.')
-    setCliente((prev) => (prev ? { ...prev, deletedAt: null } : prev))
+    queryClient.setQueryData(['cliente', id], prevSnapshot)
   }
 
   async function restoreCliente() {
     if (!cliente) return
     setError('')
-    setCliente((prev) => (prev ? { ...prev, deletedAt: null } : prev))
 
-    const { error: updErr } = await supabase.from('clientes').update({ deletedAt: null }).eq('id', id)
-    if (!updErr) return
+    const prevSnapshot = queryClient.getQueryData(['cliente', id])
+    queryClient.setQueryData(['cliente', id], (prev) => (prev ? { ...prev, deleted_at: null } : prev))
+
+    const { error: updErr } = await supabase.from('clientes').update({ deleted_at: null }).eq('id', id)
+    if (!updErr) {
+      queryClient.invalidateQueries({ queryKey: ['clientes'] })
+      return
+    }
 
     setError('No se pudo restaurar el cliente.')
-    setCliente((prev) => (prev ? { ...prev, deletedAt: cliente.deletedAt } : prev))
+    queryClient.setQueryData(['cliente', id], prevSnapshot)
   }
 
   async function deleteClientePermanente() {
@@ -187,6 +223,9 @@ export default function ClienteDetailPage() {
       return
     }
 
+    queryClient.invalidateQueries({ queryKey: ['clientes'] })
+    queryClient.removeQueries({ queryKey: ['cliente', id] })
+    queryClient.removeQueries({ queryKey: ['movimientos_cliente_por_cliente', id] })
     navigate('/clientes')
   }
 
@@ -227,7 +266,7 @@ export default function ClienteDetailPage() {
 
   useEffect(() => {
     setMovPage(1)
-  }, [showTrash, movQuery, movTipo, movEstado, movCanal, movPageSize])
+  }, [showTrash, movQuery, movTipo, movEstado, movPageSize])
 
   const filteredMovs = useMemo(() => {
     const base = showTrash ? trashedMovs : movs
@@ -236,7 +275,6 @@ export default function ClienteDetailPage() {
     return base.filter((m) => {
       if (movTipo && String(m.tipo_movimiento || '') !== movTipo) return false
       if (movEstado && String(m.estado || '') !== movEstado) return false
-      if (movCanal && String(m.canal_atribucion || '') !== movCanal) return false
 
       if (q) {
         const hay = [
@@ -254,7 +292,7 @@ export default function ClienteDetailPage() {
 
       return true
     })
-  }, [movCanal, movEstado, movQuery, movTipo, movs, showTrash, trashedMovs])
+  }, [movEstado, movQuery, movTipo, movs, showTrash, trashedMovs])
 
   const movTotalPages = useMemo(() => {
     const n = Math.ceil(filteredMovs.length / Math.max(1, movPageSize))
@@ -268,12 +306,13 @@ export default function ClienteDetailPage() {
   }, [filteredMovs, movPage, movPageSize, movTotalPages])
 
   function openMovModal() {
+    const canalDefault = String(cliente?.canal_origen || CHANNELS[0] || '')
     setMovDraft({
       fecha: toInputDate(new Date().toISOString()),
       tipo_movimiento: 'venta',
       estado: 'confirmado',
       monto: '',
-      canal_atribucion: CHANNELS[0] || '',
+      canal_atribucion: canalDefault,
       tipo_venta: '',
       producto: '',
       metodo_pago: '',
@@ -285,13 +324,14 @@ export default function ClienteDetailPage() {
 
   function openEditMovModal(m) {
     if (!m) return
+    const canalDefault = String(cliente?.canal_origen || m.canal_atribucion || CHANNELS[0] || '')
     setMovDraft({
       id: m.id,
       fecha: toInputDate(m.fecha),
       tipo_movimiento: m.tipo_movimiento || 'venta',
       estado: m.estado || 'confirmado',
       monto: String(m.monto ?? ''),
-      canal_atribucion: m.canal_atribucion || (CHANNELS[0] || ''),
+      canal_atribucion: canalDefault,
       tipo_venta: m.tipo_venta || '',
       producto: m.producto || '',
       metodo_pago: m.metodo_pago || '',
@@ -310,13 +350,15 @@ export default function ClienteDetailPage() {
     if (!movDraft) return
     setError('')
 
+    const canalFinal = String(cliente?.canal_origen || movDraft.canal_atribucion || '').trim() || null
+
     const payload = {
       cliente_id: id,
       fecha: movDraft.fecha,
       tipo_movimiento: movDraft.tipo_movimiento,
       estado: movDraft.estado,
       monto: safeNumber(movDraft.monto),
-      canal_atribucion: movDraft.canal_atribucion,
+      canal_atribucion: canalFinal,
       tipo_venta: movDraft.tipo_venta || null,
       producto: movDraft.producto || null,
       metodo_pago: movDraft.metodo_pago || null,
@@ -337,14 +379,16 @@ export default function ClienteDetailPage() {
         return
       }
 
-      setMovs((prev) => {
-        const next = prev.map((row) => (row.id === data.id ? data : row))
+      queryClient.setQueryData(['movimientos_cliente_por_cliente', id], (prev) => {
+        const base = Array.isArray(prev) ? prev : []
+        const next = base.map((row) => (row.id === data.id ? data : row))
         return [...next].sort((a, b) => {
           const d = String(b.fecha || '').localeCompare(String(a.fecha || ''))
           if (d !== 0) return d
           return String(b.created_at || '').localeCompare(String(a.created_at || ''))
         })
       })
+      queryClient.invalidateQueries({ queryKey: ['movimientos_cliente'] })
       closeMovModal()
       return
     }
@@ -355,49 +399,59 @@ export default function ClienteDetailPage() {
       return
     }
 
-    setMovs((prev) => [data, ...prev])
+    queryClient.setQueryData(['movimientos_cliente_por_cliente', id], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      return [data, ...base]
+    })
+    queryClient.invalidateQueries({ queryKey: ['movimientos_cliente'] })
     closeMovModal()
   }
 
   async function trashMovimiento(movId) {
-    const target = movs.find((m) => m.id === movId)
+    const target = allMovs.find((m) => m.id === movId)
     if (!target) return
 
     setError('')
-    setMovs((prev) => prev.filter((m) => m.id !== movId))
-    setTrashedMovs((prev) => [{ ...target, deletedAt: new Date().toISOString() }, ...prev])
-
     const now = new Date().toISOString()
+    const prevSnapshot = queryClient.getQueryData(['movimientos_cliente_por_cliente', id])
+
+    queryClient.setQueryData(['movimientos_cliente_por_cliente', id], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      return base.map((m) => (m.id === movId ? { ...m, deletedAt: now } : m))
+    })
+
     const { error: updErr } = await supabase.from('movimientos_cliente').update({ deletedAt: now }).eq('id', movId)
-    if (!updErr) return
+    if (!updErr) {
+      queryClient.invalidateQueries({ queryKey: ['movimientos_cliente'] })
+      return
+    }
 
     const msg = String(updErr.message || '')
     if (msg.toLowerCase().includes('deletedat') && msg.toLowerCase().includes('does not exist')) {
       const { error: delErr } = await supabase.from('movimientos_cliente').delete().eq('id', movId)
       if (delErr) {
         setError('No se pudo eliminar el movimiento.')
-        setMovs((prev) => [target, ...prev])
-        setTrashedMovs((prev) => prev.filter((m) => m.id !== movId))
+        queryClient.setQueryData(['movimientos_cliente_por_cliente', id], prevSnapshot)
+      } else {
+        queryClient.invalidateQueries({ queryKey: ['movimientos_cliente'] })
       }
       return
     }
 
     setError('No se pudo enviar a papelera.')
-    setMovs((prev) => [target, ...prev])
-    setTrashedMovs((prev) => prev.filter((m) => m.id !== movId))
+    queryClient.setQueryData(['movimientos_cliente_por_cliente', id], prevSnapshot)
   }
 
   async function restoreMovimiento(movId) {
-    const target = trashedMovs.find((m) => m.id === movId)
+    const target = allMovs.find((m) => m.id === movId)
     if (!target) return
 
     setError('')
-    setTrashedMovs((prev) => prev.filter((m) => m.id !== movId))
-    setMovs((prev) => {
-      const next = [
-        { ...target, deletedAt: null },
-        ...prev,
-      ]
+
+    const prevSnapshot = queryClient.getQueryData(['movimientos_cliente_por_cliente', id])
+    queryClient.setQueryData(['movimientos_cliente_por_cliente', id], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      const next = base.map((m) => (m.id === movId ? { ...m, deletedAt: null } : m))
       return [...next].sort((a, b) => {
         const d = String(b.fecha || '').localeCompare(String(a.fecha || ''))
         if (d !== 0) return d
@@ -406,25 +460,35 @@ export default function ClienteDetailPage() {
     })
 
     const { error: updErr } = await supabase.from('movimientos_cliente').update({ deletedAt: null }).eq('id', movId)
-    if (!updErr) return
+    if (!updErr) {
+      queryClient.invalidateQueries({ queryKey: ['movimientos_cliente'] })
+      return
+    }
 
     setError('No se pudo restaurar el movimiento.')
-    setMovs((prev) => prev.filter((m) => m.id !== movId))
-    setTrashedMovs((prev) => [target, ...prev])
+    queryClient.setQueryData(['movimientos_cliente_por_cliente', id], prevSnapshot)
   }
 
   async function deleteMovimientoPermanente(movId) {
-    const target = trashedMovs.find((m) => m.id === movId)
+    const target = allMovs.find((m) => m.id === movId)
     if (!target) return
 
     setError('')
-    setTrashedMovs((prev) => prev.filter((m) => m.id !== movId))
+
+    const prevSnapshot = queryClient.getQueryData(['movimientos_cliente_por_cliente', id])
+    queryClient.setQueryData(['movimientos_cliente_por_cliente', id], (prev) => {
+      const base = Array.isArray(prev) ? prev : []
+      return base.filter((m) => m.id !== movId)
+    })
 
     const { error: delErr } = await supabase.from('movimientos_cliente').delete().eq('id', movId)
-    if (!delErr) return
+    if (!delErr) {
+      queryClient.invalidateQueries({ queryKey: ['movimientos_cliente'] })
+      return
+    }
 
     setError('No se pudo eliminar permanentemente el movimiento.')
-    setTrashedMovs((prev) => [target, ...prev])
+    queryClient.setQueryData(['movimientos_cliente_por_cliente', id], prevSnapshot)
   }
 
   if (loading) {
@@ -540,6 +604,44 @@ export default function ClienteDetailPage() {
         </div>
       ) : null}
 
+      {isClienteModalOpen && clienteDraft && canalMenu ? (
+        <div className="fixed inset-0 z-[55]">
+          <button
+            type="button"
+            onClick={closeCanalMenu}
+            className="absolute inset-0 h-full w-full cursor-default bg-transparent"
+          />
+          <div
+            className="fixed"
+            style={{
+              top: (canalMenu.rect?.top ?? 0) + (canalMenu.rect?.height ?? 0) + 8,
+              left: canalMenu.rect?.left ?? 0,
+              width: canalMenu.rect?.width ?? 280,
+            }}
+          >
+            <div className="max-h-60 overflow-auto rounded-2xl border border-slate-200 bg-white p-1 text-sm shadow-soft dark:border-slate-800 dark:bg-slate-950">
+              {CHANNELS.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => {
+                    setClienteDraft((d) => ({ ...d, canal_origen: c }))
+                    closeCanalMenu()
+                  }}
+                  className={
+                    c === clienteDraft.canal_origen
+                      ? 'block w-full rounded-xl bg-slate-100 px-3 py-2 text-left font-semibold text-slate-900 dark:bg-slate-900 dark:text-slate-100'
+                      : 'block w-full rounded-xl px-3 py-2 text-left text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-900'
+                  }
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
         <Card title="Ingresos netos">
           <div className="text-lg font-semibold text-slate-900 dark:text-slate-100">${kpis.ingresosNetos.toLocaleString('es-MX')}</div>
@@ -623,19 +725,6 @@ export default function ClienteDetailPage() {
             {MOV_STATUS.map((t) => (
               <option key={t.value} value={t.value}>
                 {t.label}
-              </option>
-            ))}
-          </select>
-
-          <select
-            value={movCanal}
-            onChange={(e) => setMovCanal(e.target.value)}
-            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
-          >
-            <option value="">Canal (todos)</option>
-            {CHANNELS.map((c) => (
-              <option key={c} value={c}>
-                {c}
               </option>
             ))}
           </select>
@@ -865,21 +954,6 @@ export default function ClienteDetailPage() {
                   />
                 </label>
 
-                <label className="grid gap-1 md:col-span-2">
-                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Canal atribución</span>
-                  <select
-                    value={movDraft.canal_atribucion}
-                    onChange={(e) => setMovDraft((d) => ({ ...d, canal_atribucion: e.target.value }))}
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
-                  >
-                    {CHANNELS.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
                 <label className="grid gap-1">
                   <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Tipo venta</span>
                   <input
@@ -1000,6 +1074,20 @@ export default function ClienteDetailPage() {
                     onChange={(e) => setClienteDraft((d) => ({ ...d, telefono: e.target.value }))}
                     className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100"
                   />
+                </label>
+
+                <label className="grid gap-1 min-w-0">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">Canal de origen</span>
+                  <button
+                    type="button"
+                    onClick={openCanalMenu}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-sm text-slate-900 shadow-sm hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100 dark:hover:bg-slate-900"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 truncate">{clienteDraft.canal_origen || '-'}</span>
+                      <span className="text-slate-500 dark:text-slate-400">▾</span>
+                    </div>
+                  </button>
                 </label>
 
                 <label className="grid gap-1 md:col-span-2">

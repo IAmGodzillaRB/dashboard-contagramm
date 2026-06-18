@@ -40,6 +40,7 @@ export function aggregate(rows) {
   const roi = totals.inversion > 0 ? ((totals.ingresos - totals.inversion) / totals.inversion) * 100 : 0
   const cac = safeDiv(totals.inversion, totals.clientesNuevos)
   const ticketPromedio = safeDiv(totals.ingresos, totals.numeroVentas)
+  const tasaConversion = totals.leads > 0 ? (totals.clientesNuevos / totals.leads) * 100 : 0
 
-  return { ...totals, roi, cac, ticketPromedio }
+  return { ...totals, roi, cac, ticketPromedio, tasaConversion }
 }
